@@ -1,4 +1,4 @@
-# AI PARSE PIPELINE
+# ** AI PARSE PIPELINE
 """Production orchestrator for the ai_parse extraction branch.
 
 Wraps the full operational flow into ONE entry point so the notebook stays thin
@@ -59,22 +59,33 @@ def _run_ai_parse(spark, path: str, image_output_path: str = None):
     ).collect()[0]["p"]
 
 
-def _build_figure_crop_fn(spark, image_output_path, dbutils_ref):
+# optional debug: when set (via set_crop_debug_dir), each chart crop sent to
+# Sonnet is also written here as a PNG for inspection. None = don't save.
+_SAVE_CROPS_TO = None
+
+
+def set_crop_debug_dir(path):
+    """Notebook helper: set a Volumes folder to save each chart crop to (for
+    inspection), or None to turn it off."""
+    global _SAVE_CROPS_TO
+    _SAVE_CROPS_TO = path
+
+
+def _build_figure_crop_fn(spark, image_output_path, dbutils_ref,
+                          all_elements=None, save_crops_to=None):
     """Build a crop_figure_image(el) callable for Option A.
 
-    ai_parse renders WHOLE PAGES to images (each page image contains that page's
-    logos, tables, text AND figures). Sending a whole page to Sonnet would make
-    it re-read the tables/text we already extracted -> duplication. So we CROP
-    just the figure's region out of its page image using the figure's bbox, and
-    send only that crop to Sonnet. Sonnet then reads only the chart.
+    ai_parse renders WHOLE PAGES to images. We send the figure's FULL PAGE image
+    (full resolution) to Sonnet — this is what tested correctly for reading chart
+    values (a downsized or mis-cropped image makes the model read the axis scale,
+    not the data). Sonnet is instructed (via the chart prompt) and enforced (via
+    source_type) to read CHARTS ONLY, ignoring tables/text — so there is no
+    duplication of the rule-based table/text claims.
 
-    Mapping: page images are hash-named, so we order them by modification time
-    and map page N -> the Nth image (the folder holds only THIS document's pages,
-    cleared per document). The figure's bbox (coords relative to the rendered
-    page image) gives the crop rectangle.
+    save_crops_to: optional folder — saves each page image sent to Sonnet, for
+    inspection.
     """
     from PIL import Image
-    from ..search.figure_preprocessor import encode_image_base64
 
     try:
         imgs = sorted(dbutils_ref.fs.ls(image_output_path),
@@ -97,37 +108,33 @@ def _build_figure_crop_fn(spark, image_output_path, dbutils_ref):
         except Exception:
             return None
 
+    _counter = {"n": 0}
+
     def crop(el):
-        # Send the WHOLE PAGE image (matching what works): ai_parse's bbox
-        # coordinates don't reliably map to the rendered page image's pixel
-        # space (page sizes differ), so cropping lands on the wrong region and
-        # Sonnet reads the wrong thing. The full page gives Sonnet the complete
-        # chart with its axis and labels, which reads correctly. Duplication of
-        # already-extracted tables/text is removed downstream by de-duplication.
+        # send the figure's FULL PAGE at full resolution.
+        import base64 as _b64, io as _io
         bbox = getattr(el, "bbox", None)
-        page_id = 1
-        if bbox and isinstance(bbox, list) and isinstance(bbox[0], dict):
-            page_id = bbox[0].get("page_id", 1)
+        page_id = (bbox[0].get("page_id", 1)
+                   if bbox and isinstance(bbox, list) and isinstance(bbox[0], dict)
+                   else 1)
         page_img = _page_image(page_id)
         if page_img is None:
             return None
         try:
-            # FULL RESOLUTION — do NOT downsize. A downsized page shrinks the
-            # chart so much that the vision model reads the axis scale instead of
-            # the bar/line values. Encoding at full res (as genuine PNG, matching
-            # the client's image/png media type) lets it read the real values.
-            # Duplication of table/text the page also contains is removed by the
-            # downstream de-duplication.
-            import base64 as _b64, io as _io
             rgb = page_img.convert("RGB")
+            if save_crops_to:
+                try:
+                    _counter["n"] += 1
+                    outp = f"{save_crops_to}/page_{_counter['n']}.png".replace("dbfs:", "")
+                    rgb.save(outp)
+                except Exception:
+                    pass
             buf = _io.BytesIO()
-            rgb.save(buf, format="PNG")
+            rgb.save(buf, format="PNG")            # full-res genuine PNG
             buf.seek(0)
             return _b64.b64encode(buf.read()).decode()
         except Exception:
             return None
-
-    return crop
 
     return crop
 
@@ -218,6 +225,24 @@ def _index_ai_parse_elements(parsed_response, sub, search_store, entity_ref,
 
 def run_ai_parse_batch(spark, submissions, storage, *, audit=None,
                        search_store=None, limit=None, use_sonnet=False,
+                       llm_client=None, run_async_fn=None) -> BatchResult:
+    """Run the ai_parse branch over a batch of submissions, end-to-end.
+
+    Args:
+      spark        — the Spark session.
+      submissions  — list of {path, team, report_type, entity_ref}.
+      storage      — a DeltaLakeStorage (already prefix-configured by caller).
+      audit        — optional AuditLog; created if None.
+      search_store — optional vector store for indexing (RAG). None -> no index.
+      limit        — process only the first N submissions (None = all).
+      use_sonnet   — escalate hard figures to Sonnet (needs llm_client +
+                     run_async_fn). Default False = pure rule-based (cheapest).
+
+    Returns a BatchResult summary. Writes gold, silver, review, quarantine,
+    audit, and (if search_store given) the index — the full operational set.
+    """
+def run_ai_parse_batch(spark, submissions, storage, *, audit=None,
+                       search_store=None, limit=None, use_sonnet=False,
                        llm_client=None, run_async_fn=None,
                        image_output_path=None, dbutils=None) -> BatchResult:
     """Run the ai_parse branch over a batch of submissions, end-to-end.
@@ -263,13 +288,13 @@ def run_ai_parse_batch(spark, submissions, storage, *, audit=None,
                 except Exception:
                     pass
                 parsed = _run_ai_parse(spark, path, image_output_path)
-                crop_fn = _build_figure_crop_fn(spark, image_output_path, dbutils)
             else:
                 parsed = _run_ai_parse(spark, path)
             audit.log(result.run_id, "ai_parse", path, detail=f"parsed {fname}")
 
             # tag each figure with its index (position among figures) so the
             # crop fn can map it to the correct rendered image.
+            crop_fn = None
             if option_a:
                 from .hybrid_extraction import parse_ai_parse_response
                 _els = parse_ai_parse_response(parsed)
@@ -278,6 +303,12 @@ def run_ai_parse_batch(spark, submissions, storage, *, audit=None,
                     if e.el_type == "figure":
                         e.figure_index = fi
                         fi += 1
+                # build the crop fn WITH the elements (so chart_region can find
+                # each chart's adjacent header/legend) and an optional debug save
+                # path from the module global set by the notebook.
+                crop_fn = _build_figure_crop_fn(
+                    spark, image_output_path, dbutils,
+                    all_elements=_els, save_crops_to=_SAVE_CROPS_TO)
 
             claims = hybrid_extract_document(
                 ai_parse_response=parsed, filename=fname,
@@ -345,7 +376,30 @@ def run_ai_parse_batch(spark, submissions, storage, *, audit=None,
         storage.write_audit(audit.to_rows())
     except Exception:
         pass
+    _log_run_to_mlflow(result, run_name="ai_parse_batch",
+                       params={"use_sonnet": use_sonnet, "limit": limit})
     return result
+
+
+def _log_run_to_mlflow(result, run_name="pipeline_run", params=None):
+    """Log the run's scorecard metrics to MLflow — only when MLflow is present
+    and enabled in config. Safe no-op otherwise (never breaks the run)."""
+    try:
+        from ..shared.config import CONFIG
+        if not getattr(getattr(CONFIG, "observability", None), "mlflow_tracing", False):
+            return
+        import mlflow
+        from .scorecard import build_scorecard
+        sc = build_scorecard(result)
+        with mlflow.start_run(run_name=run_name):
+            if params:
+                mlflow.log_params(params)
+            for section in ("coverage", "quality", "robustness", "cost"):
+                for k, v in sc[section].items():
+                    if isinstance(v, (int, float)):
+                        mlflow.log_metric(k, v)
+    except Exception:
+        pass
 
 
 def run_ai_extract_batch(spark, submissions, storage, *, audit=None,
@@ -423,7 +477,7 @@ def run_ai_extract_batch(spark, submissions, storage, *, audit=None,
         pass
     return result
 
-# HYBRID EXTRACTION
+# ** HYBRID EXTRACTION
 """Hybrid figure/table extraction: ai_parse_document first, Sonnet for hard charts.
 
 The design (validated on real documents):
@@ -1098,7 +1152,7 @@ def _prefix(title, section, suffix=None):
         parts.append(suffix)
     return " | ".join(parts) if parts else None
 
-# AI PARSE STRUCTURER
+# ** AI PARSE STRUCTURER
 """Rule-based structuring of ai_parse_document output into composite-named
 claims — NO LLM cost. ai_parse returns tables as HTML (``<table><tr><th>...``)
 and text as blobs; both are structured enough to parse with code, so we build
@@ -1524,7 +1578,7 @@ def numbers_from_text(text: str, filename: str, page: Optional[int] = None,
             model_used="ai_parse_rule_structured"))
     return claims
 
-# SCHEMA
+# ** SCHEMA
 """Shared data contracts used across every module.
 
 Uses Pydantic v2. Validation failures route to a quarantine table rather
@@ -1753,7 +1807,7 @@ def build_claim(raw: dict, quarantine: list[dict]) -> Optional[Claim]:
     except Exception as exc:
         quarantine.append({"kind": "claim", "raw": raw, "error": str(exc)})
         return None
-
+    
 # LLM CLIENT
 """Unified async LLM client over Databricks serving endpoints.
 
