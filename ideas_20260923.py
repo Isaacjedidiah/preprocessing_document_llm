@@ -701,3 +701,163 @@ def run_ai_extract_batch(spark, submissions, storage, *, audit=None,
         pass
     return result
 
+# Content Extraction Test
+# =============================================================================
+#  INVESTIGATE: page->image mapping + coords (the FULL picture)
+#  FREE — no LLM, only ai_parse (cheap) + inspecting the parsed response.
+#  Run this as ONE notebook cell.
+# =============================================================================
+import json
+
+# =============================================================================
+#  SETUP — get `raw` (the ai_parse response) and IMG_OUT
+# =============================================================================
+from preprocessing_etl.custom.ai_parse_pipeline import _run_ai_parse
+
+# --- point at ONE document to investigate (use a chart-heavy one) ---
+DOC_PATH = submissions[0]["path"]      # or hard-code a specific document path
+IMG_OUT  = "/Volumes/<catalog>/<schema>/<volume>/ai_parse_figures"
+
+# --- clear the image folder so it holds ONLY this document's pages ---
+dbutils.fs.rm(IMG_OUT, recurse=True)
+dbutils.fs.mkdirs(IMG_OUT)
+
+# --- run ai_parse ONCE (this is cheap — ai_parse DBUs only, NO Sonnet) ---
+raw = _run_ai_parse(spark, DOC_PATH, IMG_OUT)
+print(f"parsed: {DOC_PATH}")
+print(f"images rendered to: {IMG_OUT}")
+print()
+
+# =============================================================================
+#  0. get the parsed response as a dict
+# =============================================================================
+d = json.loads(raw.toJson()) if hasattr(raw, "toJson") else (
+    json.loads(raw) if isinstance(raw, str) else raw)
+doc = d.get("document", d)
+
+# =============================================================================
+# 1. PAGES ARRAY — does it have image_uri (the reliable link)?
+# =============================================================================
+pages = d.get("pages") or doc.get("pages")
+print("=" * 64)
+print("1. PAGES ARRAY (the reliable page->image link)")
+print("=" * 64)
+if pages:
+    print(f"pages array found: {len(pages)} pages")
+    for pg in pages[:6]:
+        print(f"  id={pg.get('id')}  image_uri={pg.get('image_uri')}")
+        print(f"     (all keys: {list(pg.keys())})")
+else:
+    print("NO pages array found.")
+    print("top-level keys:", list(d.keys()))
+    if "document" in d:
+        print("document keys:", list(doc.keys()))
+
+# =============================================================================
+# 2. FIGURE ELEMENTS — page_id AND coord (the full bbox structure)
+# =============================================================================
+figs = [e for e in doc.get("elements", []) if e.get("type") == "figure"]
+print()
+print("=" * 64)
+print(f"2. FIGURE ELEMENTS: {len(figs)} — page_id + coord")
+print("=" * 64)
+for i, f in enumerate(figs[:10]):
+    bb = f.get("bbox")
+    page_id, coord, all_keys = None, None, None
+    if bb and isinstance(bb, list) and isinstance(bb[0], dict):
+        b0 = bb[0]
+        page_id = b0.get("page_id")
+        all_keys = list(b0.keys())
+        coord = (b0.get("coord") or b0.get("bbox") or b0.get("polygon")
+                 or b0.get("rectangle") or b0.get("box"))
+        if coord is None and all(k in b0 for k in ("x0", "y0", "x1", "y1")):
+            coord = [b0.get("x0"), b0.get("y0"), b0.get("x1"), b0.get("y1")]
+    print(f"  figure {i}: page_id={page_id}")
+    print(f"     bbox[0] keys: {all_keys}")
+    print(f"     coord: {coord}")
+    print(f"     content: {str(f.get('content'))[:50]}")
+
+# =============================================================================
+# 3. COORD REFERENCE — do coords match the image size, or need scaling?
+# =============================================================================
+print()
+print("=" * 64)
+print("3. COORD REFERENCE (do coords match image pixels?)")
+print("=" * 64)
+max_x = max_y = 0
+for e in doc.get("elements", []):
+    bb = e.get("bbox")
+    if bb and isinstance(bb, list) and isinstance(bb[0], dict):
+        b0 = bb[0]
+        c = (b0.get("coord") or b0.get("bbox") or
+             ([b0.get("x0"), b0.get("y0"), b0.get("x1"), b0.get("y1")]
+              if "x0" in b0 else None))
+        if c and len(c) >= 4 and all(isinstance(v, (int, float)) for v in c[:4]):
+            max_x = max(max_x, c[2]); max_y = max(max_y, c[3])
+print(f"max coord across all elements: x={max_x}, y={max_y}")
+print("(this ~= the coordinate reference page size)")
+
+# auto-check against an actual image's pixel size
+try:
+    from PIL import Image
+    imgs0 = sorted(dbutils.fs.ls(IMG_OUT), key=lambda x: x.modificationTime)
+    if imgs0:
+        p0 = imgs0[0].path.replace("dbfs:/Volumes", "/Volumes").replace("dbfs:", "/dbfs")
+        im0 = Image.open(p0)
+        iw, ih = im0.size
+        print(f"first image pixel size: {iw} x {ih}")
+        if max_x and max_y:
+            print(f"implied scale: x={iw/max_x:.2f}, y={ih/max_y:.2f}")
+            print(">>> scale ~1.0 = coords ARE image pixels; ~4.x = coords in smaller space (scale before crop)")
+except Exception as e:
+    print(f"(could not auto-check image size: {e})")
+    print(">>> open one image manually and compute scale = image_size / max_coord")
+
+# =============================================================================
+# 4. MAPPING CHECK — can we link figure page_id -> pages image_uri?
+# =============================================================================
+print()
+print("=" * 64)
+print("4. MAPPING CHECK (figure page_id -> image_uri)")
+print("=" * 64)
+if pages and figs:
+    page_ids_in_pages = {pg.get("id") for pg in pages}
+    fig_page_ids = set()
+    for f in figs:
+        bb = f.get("bbox")
+        if bb and isinstance(bb, list) and isinstance(bb[0], dict):
+            fig_page_ids.add(bb[0].get("page_id"))
+    print(f"pages array ids: {sorted(page_ids_in_pages)}")
+    print(f"figure page_ids: {sorted(x for x in fig_page_ids if x is not None)}")
+    if fig_page_ids & page_ids_in_pages:
+        print("-> DIRECT MATCH: use pages[page_id].image_uri")
+    elif {p - 1 for p in fig_page_ids if p is not None} & page_ids_in_pages:
+        print("-> OFF BY ONE: figure page_id 1-based, pages id 0-based -> pages[page_id-1].image_uri")
+    else:
+        print("-> NO obvious match; inspect the ids above manually")
+
+# =============================================================================
+# 5. CURRENT (modification-time) ORDER — the unstable mapping in use now
+# =============================================================================
+print()
+print("=" * 64)
+print("5. CURRENT modification-time image order (the UNSTABLE mapping)")
+print("=" * 64)
+try:
+    imgs = sorted(dbutils.fs.ls(IMG_OUT), key=lambda x: x.modificationTime)
+    print(f"{len(imgs)} images by modification time:")
+    for i, im in enumerate(imgs[:8]):
+        print(f"  index {i}: {im.name}")
+    print()
+    print(">>> If image_uri order (section 1) differs from THIS order, that's the instability.")
+except Exception as e:
+    print(f"could not list IMG_OUT: {e}")
+
+print()
+print("=" * 64)
+print("SUMMARY — report back:")
+print("  (1) does pages have image_uri?          (section 1)")
+print("  (2) figure coord + its bbox keys        (section 2)")
+print("  (3) the coord scale vs image size       (section 3)")
+print("  (4) direct match or off-by-one          (section 4)")
+print("=" * 64)
