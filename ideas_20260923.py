@@ -1144,24 +1144,6 @@ def _index_ai_parse_elements(parsed_response, sub, search_store, entity_ref,
 
 def run_ai_parse_batch(spark, submissions, storage, *, audit=None,
                        search_store=None, limit=None, use_sonnet=False,
-                       llm_client=None, run_async_fn=None) -> BatchResult:
-    """Run the ai_parse branch over a batch of submissions, end-to-end.
-
-    Args:
-      spark        — the Spark session.
-      submissions  — list of {path, team, report_type, entity_ref}.
-      storage      — a DeltaLakeStorage (already prefix-configured by caller).
-      audit        — optional AuditLog; created if None.
-      search_store — optional vector store for indexing (RAG). None -> no index.
-      limit        — process only the first N submissions (None = all).
-      use_sonnet   — escalate hard figures to Sonnet (needs llm_client +
-                     run_async_fn). Default False = pure rule-based (cheapest).
-
-    Returns a BatchResult summary. Writes gold, silver, review, quarantine,
-    audit, and (if search_store given) the index — the full operational set.
-    """
-def run_ai_parse_batch(spark, submissions, storage, *, audit=None,
-                       search_store=None, limit=None, use_sonnet=False,
                        llm_client=None, run_async_fn=None,
                        image_output_path=None, dbutils=None) -> BatchResult:
     """Run the ai_parse branch over a batch of submissions, end-to-end.
