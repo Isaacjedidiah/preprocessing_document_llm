@@ -936,29 +936,34 @@ def set_crop_debug_dir(path):
 
 
 def _extract_pages_array(parsed_response):
-    """Pull ai_parse's ``pages`` array (each {id, image_uri}) from the response,
-    across the surfaces ai_parse returns (VariantVal / JSON string / dict). This
-    gives the RELIABLE page->image mapping. Returns [] if not present."""
+    """Pull ai_parse's ``pages`` array (each {id, image_uri}) from the response.
+
+    Uses the SAME robust conversion as the validated test script: check
+    hasattr(toJson) rather than an exact type name, because the production object
+    may not be named exactly 'VariantVal' — matching the test code is what makes
+    the uri resolve in the main pipeline. Returns [] if no pages array."""
     import json as _json
-    data = parsed_response
+    raw = parsed_response
+    # SAME as the working test: d = json.loads(raw.toJson()) if hasattr(raw,'toJson')
+    #                               else (json.loads(raw) if isinstance(raw,str) else raw)
     try:
-        if type(parsed_response).__name__ == "VariantVal":
-            for meth in ("toJson", "to_json"):
-                if hasattr(parsed_response, meth):
-                    data = _json.loads(getattr(parsed_response, meth)())
-                    break
-        elif isinstance(parsed_response, str):
-            data = _json.loads(parsed_response)
-        elif hasattr(parsed_response, "asDict"):
-            data = parsed_response.asDict(recursive=True)
+        if hasattr(raw, "toJson"):
+            d = _json.loads(raw.toJson())
+        elif hasattr(raw, "to_json"):
+            d = _json.loads(raw.to_json())
+        elif isinstance(raw, str):
+            d = _json.loads(raw)
+        elif hasattr(raw, "asDict"):
+            d = raw.asDict(recursive=True)
+        else:
+            d = raw
     except Exception:
         return []
-    if not isinstance(data, dict):
+    if not isinstance(d, dict):
         return []
-    # pages can be at the top level or under 'document'
-    pages = data.get("pages")
-    if pages is None:
-        pages = (data.get("document") or {}).get("pages")
+    doc = d.get("document", d)
+    # SAME as the working test: pages = d.get("pages") or doc.get("pages")
+    pages = d.get("pages") or doc.get("pages")
     return pages if isinstance(pages, list) else []
 
 
@@ -1009,15 +1014,21 @@ def _build_figure_crop_fn(spark, image_output_path, dbutils_ref,
         return p
 
     def _page_image(page_id):
-        # PRIMARY: exact image_uri for this page id (ai_parse pages array).
-        # ai_parse page ids are commonly 0-based in the pages array; try the id
-        # as-is and page_id-1 to be safe.
-        for key in (page_id, (page_id - 1) if page_id else 0):
-            if key in page_uri:
-                try:
-                    return Image.open(_norm(page_uri[key]))
-                except Exception:
-                    pass
+        # PRIMARY: exact image_uri for this page id — DIRECT MATCH, exactly as
+        # the validated test confirmed (pages[page_id].image_uri). Try the id as
+        # given first (the direct match); page_id-1 only if the direct key is
+        # genuinely absent (defensive, for a 0/1-based edge).
+        if page_id in page_uri:
+            try:
+                return Image.open(_norm(page_uri[page_id]))
+            except Exception:
+                pass
+        alt = (page_id - 1) if page_id else 0
+        if alt in page_uri:
+            try:
+                return Image.open(_norm(page_uri[alt]))
+            except Exception:
+                pass
         # FALLBACK: modification-time order (only if pages array missing).
         idx = (page_id - 1) if page_id else 0
         if 0 <= idx < len(imgs):
