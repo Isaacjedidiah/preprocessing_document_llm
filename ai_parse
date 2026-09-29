@@ -275,3 +275,71 @@ for i, f in enumerate(figs):
         print(f"figure {i}: ERROR {e}")
 
 print(f"\nsaved to: {CROP_OUT}")
+
+# fifth
+
+# ========== COMPARE: v2.0 with vs without descriptionElementTypes — ALL FIGURES ==========
+import json
+
+DOC_PATH = submissions[0]["path"]
+spark.read.format("binaryFile").load(DOC_PATH).createOrReplaceTempView("_de_test")
+
+def parse_and_show(label, opts_map):
+    opts = ", ".join(f"'{k}','{v}'" for k, v in opts_map.items())
+    raw = spark.sql(f"""
+        SELECT ai_parse_document(content, map({opts})) AS parsed FROM _de_test
+    """).collect()[0]["parsed"]
+    d = json.loads(raw.toJson()) if hasattr(raw, "toJson") else raw
+    doc = d.get("document", d)
+    figs = [e for e in doc.get("elements", []) if e.get("type") == "figure"]
+    print(f"\n{'='*70}\n{label}\n{'='*70}")
+    print(f"figures: {len(figs)}\n")
+    # SHOW ALL FIGURES
+    for i, f in enumerate(figs):
+        bb = f.get("bbox")
+        page_id = bb[0].get("page_id") if bb and isinstance(bb, list) and isinstance(bb[0], dict) else None
+        print(f"--- FIGURE {i} (page {page_id}) ---")
+        print(f"  content:     {str(f.get('content'))[:250]}")
+        print(f"  description: {str(f.get('description'))[:250]}")
+        print()
+    return figs
+
+# WITHOUT descriptionElementTypes (your current working default)
+without = parse_and_show(
+    "WITHOUT descriptionElementTypes",
+    {"version": "2.0"})
+
+# WITH descriptionElementTypes=figure
+with_de = parse_and_show(
+    "WITH descriptionElementTypes=figure",
+    {"version": "2.0", "descriptionElementTypes": "figure"})
+
+# --- side-by-side comparison of ALL figures ---
+print(f"\n{'='*70}\nSIDE-BY-SIDE COMPARISON (all figures)\n{'='*70}")
+print(f"figures WITHOUT: {len(without)}, figures WITH: {len(with_de)}\n")
+
+n = max(len(without), len(with_de))
+for i in range(n):
+    print(f"===== FIGURE {i} =====")
+    wo = without[i] if i < len(without) else None
+    wd = with_de[i] if i < len(with_de) else None
+
+    wo_content = str(wo.get("content"))[:150] if wo else "(missing)"
+    wd_content = str(wd.get("content"))[:150] if wd else "(missing)"
+    wo_desc = str(wo.get("description"))[:150] if wo else "(missing)"
+    wd_desc = str(wd.get("description"))[:150] if wd else "(missing)"
+
+    print(f"  WITHOUT content: {wo_content}")
+    print(f"  WITH    content: {wd_content}")
+    print(f"  WITHOUT desc:    {wo_desc}")
+    print(f"  WITH    desc:    {wd_desc}")
+    print()
+
+# --- verdict ---
+print(f"{'='*70}\nVERDICT\n{'='*70}")
+print(f"Same figure count? {len(without) == len(with_de)}  "
+      f"(without={len(without)}, with={len(with_de)})")
+print(">>> For each figure, does WITH give richer detail (actual chart values in")
+print(">>> content or description), or does it suppress/genericize like before?")
+print(">>> If WITH loses figures or empties content -> don't use it.")
+print(">>> If WITH adds real chart data to the description -> it's an improvement.")
