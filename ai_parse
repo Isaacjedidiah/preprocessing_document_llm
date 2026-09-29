@@ -190,3 +190,88 @@ if without and with_de:
     print(f"WITH    — description: {str(with_de[0].get('description'))[:100]}")
     print("\n>>> Does WITH give MORE useful figure detail, or does it suppress content")
     print(">>> (moving values to a generic description) like it did before?")
+
+# fourth
+# ========== CROP TEST (fixed) — crop figures using v2.0 bbox, with key diagnostics ==========
+import json
+from PIL import Image
+
+DOC_PATH  = submissions[0]["path"]
+IMG_OUT   = "/Volumes/<catalog>/<schema>/<volume>/rendered_pages"
+CROP_OUT  = "/Volumes/<catalog>/<schema>/<volume>/crop_test"
+dbutils.fs.mkdirs(CROP_OUT)
+
+spark.read.format("binaryFile").load(DOC_PATH).createOrReplaceTempView("_crop_test")
+raw = spark.sql(f"""
+    SELECT ai_parse_document(content, map('version','2.0','imageOutputPath','{IMG_OUT}')) AS parsed
+    FROM _crop_test
+""").collect()[0]["parsed"]
+
+d = json.loads(raw.toJson()) if hasattr(raw, "toJson") else (
+    json.loads(raw) if isinstance(raw, str) else raw)
+doc = d.get("document", d)
+elements = doc.get("elements", [])
+pages = d.get("pages") or doc.get("pages") or []
+
+page_uri = {}
+for pg in pages:
+    if isinstance(pg, dict):
+        pid = pg.get("id") if pg.get("id") is not None else pg.get("page_id")
+        uri = pg.get("image_uri")
+        if pid is not None and uri:
+            page_uri[pid] = uri
+
+def _norm(p):
+    return p.replace("dbfs:/Volumes", "/Volumes").replace("dbfs:", "/dbfs") if p else p
+
+figs = [e for e in elements if e.get("type") == "figure"]
+print(f"figures: {len(figs)}, pages in uri map: {sorted(page_uri.keys())}\n")
+
+# --- FIRST: show the RAW bbox of figure 0 so we see the actual key names ---
+if figs:
+    print("=== RAW bbox of figure 0 (to see actual keys) ===")
+    print(json.dumps(figs[0].get("bbox"), indent=2, default=str))
+    print()
+
+def _num(v):
+    """safely get a number, or None"""
+    try:
+        return float(v) if v is not None else None
+    except (ValueError, TypeError):
+        return None
+
+for i, f in enumerate(figs):
+    bb = f.get("bbox")
+    if not bb or not isinstance(bb, list) or not isinstance(bb[0], dict):
+        print(f"figure {i}: no usable bbox")
+        continue
+    b0 = bb[0]
+    page_id = b0.get("page_id")
+
+    # try multiple possible key names for the coordinates
+    x0 = _num(b0.get("x_min") or b0.get("xmin") or b0.get("x0") or b0.get("left"))
+    y0 = _num(b0.get("y_min") or b0.get("ymin") or b0.get("y0") or b0.get("top"))
+    x1 = _num(b0.get("x_max") or b0.get("xmax") or b0.get("x1") or b0.get("right"))
+    y1 = _num(b0.get("y_max") or b0.get("ymax") or b0.get("y1") or b0.get("bottom"))
+
+    if None in (x0, y0, x1, y1):
+        print(f"figure {i}: coords missing -> bbox keys were: {list(b0.keys())}, values: {b0}")
+        continue
+
+    uri = page_uri.get(page_id)
+    if not uri:
+        print(f"figure {i}: page {page_id} not in uri map")
+        continue
+
+    try:
+        img = Image.open(_norm(uri)).convert("RGB")
+        iw, ih = img.size
+        print(f"figure {i}: page={page_id} image={iw}x{ih} bbox=[{x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}]")
+        crop = img.crop((int(x0), int(y0), int(x1), int(y1)))
+        out = f"{CROP_OUT}/figure_{i}_page{page_id}.png"
+        crop.save(_norm(out))
+        print(f"           saved {crop.size[0]}x{crop.size[1]} -> figure_{i}_page{page_id}.png")
+    except Exception as e:
+        print(f"figure {i}: ERROR {e}")
+
+print(f"\nsaved to: {CROP_OUT}")
