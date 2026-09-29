@@ -60,3 +60,88 @@ if figs:
 # --- 4. also check: does the response have a top-level pages array? ---
 pages = d.get("pages") or doc.get("pages")
 print(f"\npages array present: {bool(pages)} ({len(pages) if pages else 0} pages)")
+
+# second
+# ========== CROP TEST: crop all figures using v2.0 bbox coords, save to inspect ==========
+import json
+from PIL import Image
+
+# --- CONFIG ---
+DOC_PATH  = submissions[0]["path"]      # the document
+IMG_OUT   = "/Volumes/<catalog>/<schema>/<volume>/rendered_pages"   # where v2 renders pages
+CROP_OUT  = "/Volumes/<catalog>/<schema>/<volume>/crop_test"        # where to save crops
+dbutils.fs.mkdirs(CROP_OUT)
+
+# --- 1. parse with version 2.0 (renders pages to IMG_OUT) ---
+spark.read.format("binaryFile").load(DOC_PATH).createOrReplaceTempView("_crop_test")
+raw = spark.sql(f"""
+    SELECT ai_parse_document(
+        content,
+        map('version', '2.0', 'imageOutputPath', '{IMG_OUT}')
+    ) AS parsed
+    FROM _crop_test
+""").collect()[0]["parsed"]
+
+d = json.loads(raw.toJson()) if hasattr(raw, "toJson") else (
+    json.loads(raw) if isinstance(raw, str) else raw)
+doc = d.get("document", d)
+elements = doc.get("elements", [])
+pages = d.get("pages") or doc.get("pages") or []
+
+# --- 2. map page_id -> image_uri (the reliable link) ---
+page_uri = {}
+for pg in pages:
+    if isinstance(pg, dict):
+        pid = pg.get("id") if pg.get("id") is not None else pg.get("page_id")
+        uri = pg.get("image_uri")
+        if pid is not None and uri:
+            page_uri[pid] = uri
+
+def _norm(p):
+    return p.replace("dbfs:/Volumes", "/Volumes").replace("dbfs:", "/dbfs") if p else p
+
+# --- 3. crop each figure using its bbox ---
+figs = [e for e in elements if e.get("type") == "figure"]
+print(f"figures found: {len(figs)}")
+print(f"pages in uri map: {sorted(page_uri.keys())}\n")
+
+for i, f in enumerate(figs):
+    bb = f.get("bbox")
+    if not bb or not isinstance(bb, list) or not isinstance(bb[0], dict):
+        print(f"figure {i}: NO bbox, skipped")
+        continue
+    b0 = bb[0]
+    page_id = b0.get("page_id")
+    x0, y0 = b0.get("x_min"), b0.get("y_min")
+    x1, y1 = b0.get("x_max"), b0.get("y_max")
+
+    # get this figure's page image
+    uri = page_uri.get(page_id)
+    if not uri:
+        print(f"figure {i}: page {page_id} not in uri map, skipped")
+        continue
+
+    try:
+        img = Image.open(_norm(uri)).convert("RGB")
+        iw, ih = img.size
+        # honest check: do the coords fit the image, or need scaling?
+        # if coords max > image size -> they're bigger (unusual); if much smaller -> may need scale
+        print(f"figure {i}: page={page_id} image={iw}x{ih} "
+              f"bbox=[{x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}]")
+
+        # crop directly (assuming coords are in image pixel space)
+        crop = img.crop((int(x0), int(y0), int(x1), int(y1)))
+        out_path = f"{CROP_OUT}/figure_{i}_page{page_id}.png".replace("dbfs:", "")
+        crop.save(_norm(out_path))
+        print(f"           saved crop ({crop.size[0]}x{crop.size[1]}) -> figure_{i}_page{page_id}.png")
+
+        # ALSO save the full page for comparison (so you can see if crop landed right)
+        if i == 0 or page_id not in [figs[j].get("bbox",[{}])[0].get("page_id") for j in range(i)]:
+            page_out = f"{CROP_OUT}/_fullpage_{page_id}.png".replace("dbfs:", "")
+            img.save(_norm(page_out))
+    except Exception as e:
+        print(f"figure {i}: ERROR {e}")
+
+print(f"\n=== crops + full pages saved to: {CROP_OUT} ===")
+print(">>> Open the crops. Does each figure_N crop show the CHART (not tables/blank)?")
+print(">>> Compare crop to _fullpage_N to see if the crop landed on the right region.")
