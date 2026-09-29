@@ -145,3 +145,48 @@ for i, f in enumerate(figs):
 print(f"\n=== crops + full pages saved to: {CROP_OUT} ===")
 print(">>> Open the crops. Does each figure_N crop show the CHART (not tables/blank)?")
 print(">>> Compare crop to _fullpage_N to see if the crop landed on the right region.")
+
+# Third
+# ========== COMPARE: v2.0 with vs without descriptionElementTypes ==========
+import json
+
+DOC_PATH = submissions[0]["path"]
+spark.read.format("binaryFile").load(DOC_PATH).createOrReplaceTempView("_de_test")
+
+def parse_and_show(label, opts_map):
+    opts = ", ".join(f"'{k}','{v}'" for k, v in opts_map.items())
+    raw = spark.sql(f"""
+        SELECT ai_parse_document(content, map({opts})) AS parsed FROM _de_test
+    """).collect()[0]["parsed"]
+    d = json.loads(raw.toJson()) if hasattr(raw, "toJson") else raw
+    doc = d.get("document", d)
+    figs = [e for e in doc.get("elements", []) if e.get("type") == "figure"]
+    print(f"\n{'='*60}\n{label}\n{'='*60}")
+    print(f"figures: {len(figs)}")
+    if figs:
+        f = figs[0]
+        print(f"  keys: {list(f.keys())}")
+        print(f"  content: {str(f.get('content'))[:200]}")
+        print(f"  description: {str(f.get('description'))[:200]}")
+    return figs
+
+# WITHOUT descriptionElementTypes (your current working default)
+without = parse_and_show(
+    "WITHOUT descriptionElementTypes",
+    {"version": "2.0"})
+
+# WITH descriptionElementTypes=figure
+with_de = parse_and_show(
+    "WITH descriptionElementTypes=figure",
+    {"version": "2.0", "descriptionElementTypes": "figure"})
+
+# --- the honest comparison ---
+print(f"\n{'='*60}\nVERDICT\n{'='*60}")
+print(f"figures WITHOUT: {len(without)}, figures WITH: {len(with_de)}")
+if without and with_de:
+    print(f"\nWITHOUT — content: {str(without[0].get('content'))[:100]}")
+    print(f"WITH    — content: {str(with_de[0].get('content'))[:100]}")
+    print(f"\nWITHOUT — description: {str(without[0].get('description'))[:100]}")
+    print(f"WITH    — description: {str(with_de[0].get('description'))[:100]}")
+    print("\n>>> Does WITH give MORE useful figure detail, or does it suppress content")
+    print(">>> (moving values to a generic description) like it did before?")
