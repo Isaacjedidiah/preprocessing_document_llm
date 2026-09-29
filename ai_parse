@@ -393,3 +393,53 @@ print(">>> For each figure, does WITH give richer detail (actual chart values in
 print(">>> content or description), or does it suppress/genericize like before?")
 print(">>> If WITH loses figures or empties content -> don't use it.")
 print(">>> If WITH adds real chart data to the description -> it's an improvement.")
+
+# edit
+    uri = page_uri.get(page_id)
+    if not uri:
+        print(f"figure {i}: page {page_id} not in uri map"); continue
+
+    try:
+        img = Image.open(_norm(uri)).convert("RGB")
+        iw, ih = img.size
+        fx0, fy0, fx1, fy1 = coord[0], coord[1], coord[2], coord[3]
+
+        # collect OTHER elements' coords on the SAME page
+        others = []
+        for oe in elements:
+            if oe is f: 
+                continue
+            obb = oe.get("bbox")
+            if obb and isinstance(obb, list) and isinstance(obb[0], dict):
+                ob0 = obb[0]
+                if ob0.get("page_id") == page_id:
+                    oc = ob0.get("coord")
+                    if oc and len(oc) >= 4:
+                        others.append(oc)
+
+        MAX_PAD = 200                      # max expansion (safety)
+        top, bottom = fy0 - MAX_PAD, fy1 + MAX_PAD
+        left, right = fx0 - MAX_PAD, fx1 + MAX_PAD
+
+        for ox0, oy0, ox1, oy1 in [(o[0], o[1], o[2], o[3]) for o in others]:
+            horiz_overlap = not (ox1 < fx0 or ox0 > fx1)      # shares vertical column
+            vert_overlap  = not (oy1 < fy0 or oy0 > fy1)      # shares horizontal row
+            if oy1 <= fy0 and horiz_overlap:                  # element above
+                top = max(top, oy1 + 5)
+            if oy0 >= fy1 and horiz_overlap:                  # element below
+                bottom = min(bottom, oy0 - 5)
+            if ox1 <= fx0 and vert_overlap:                   # element left
+                left = max(left, ox1 + 5)
+            if ox0 >= fx1 and vert_overlap:                   # element right
+                right = min(right, ox0 - 5)
+
+        x0, y0 = max(0, int(left)), max(0, int(top))
+        x1, y1 = min(iw, int(right)), min(ih, int(bottom))
+
+        crop = img.crop((x0, y0, x1, y1))
+        out = f"{CROP_OUT}/figure_{i}_page{page_id}.png"
+        crop.save(_norm(out))
+        print(f"figure {i}: page={page_id} chart={coord} expanded=[{x0},{y0},{x1},{y1}] "
+              f"saved {crop.size[0]}x{crop.size[1]}")
+    except Exception as e:
+        print(f"figure {i}: ERROR {e}")
