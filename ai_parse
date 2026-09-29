@@ -1,0 +1,62 @@
+# ========== TEST: what does ai_parse_document version 2.0 return for figures? ==========
+import json
+
+# --- point at ONE document (a chart-heavy one is best) ---
+DOC_PATH = submissions[0]["path"]      # or a specific document path
+
+# --- load the file + call ai_parse_document with version 2.0 ---
+spark.read.format("binaryFile").load(DOC_PATH).createOrReplaceTempView("_v2_test")
+
+raw_v2 = spark.sql("""
+    SELECT ai_parse_document(
+        content,
+        map('version', '2.0')
+    ) AS parsed
+    FROM _v2_test
+""").collect()[0]["parsed"]
+
+# --- convert to dict and inspect ---
+d = json.loads(raw_v2.toJson()) if hasattr(raw_v2, "toJson") else (
+    json.loads(raw_v2) if isinstance(raw_v2, str) else raw_v2)
+doc = d.get("document", d)
+elements = doc.get("elements", [])
+
+# --- 1. what element types did 2.0 find? ---
+from collections import Counter
+print("=" * 60)
+print("ELEMENT TYPES (version 2.0)")
+print("=" * 60)
+print(Counter(e.get("type") for e in elements))
+
+# --- 2. show the FULL structure of each FIGURE element ---
+figs = [e for e in elements if e.get("type") == "figure"]
+print(f"\n{'=' * 60}")
+print(f"FIGURE ELEMENTS: {len(figs)}")
+print("=" * 60)
+for i, f in enumerate(figs[:5]):
+    print(f"\n--- FIGURE {i} — ALL KEYS: {list(f.keys())} ---")
+    print(json.dumps(f, indent=2, default=str)[:2500])
+
+# --- 3. THE KEY QUESTION: is there structured chart DATA (not just a description)? ---
+print(f"\n{'=' * 60}")
+print("DOES 2.0 GIVE STRUCTURED CHART DATA?")
+print("=" * 60)
+if figs:
+    f0 = figs[0]
+    # look for keys that would hold structured chart data
+    chart_keys = [k for k in f0.keys() if any(
+        w in k.lower() for w in ("chart", "data", "series", "point", "value", "plot"))]
+    print(f"chart-data-like keys in figure: {chart_keys}")
+    print(f"has 'content': {'content' in f0}  -> {str(f0.get('content'))[:100]}")
+    print(f"has 'description': {'description' in f0}  -> {str(f0.get('description'))[:100]}")
+    # is content structured (a dict/list) or just a text blob?
+    c = f0.get("content")
+    print(f"\ncontent TYPE: {type(c).__name__}")
+    if isinstance(c, (dict, list)):
+        print(">>> STRUCTURED! version 2.0 returns chart data as structured JSON")
+    else:
+        print(">>> TEXT BLOB — 2.0 returns figures as text (like before), not structured chart data")
+
+# --- 4. also check: does the response have a top-level pages array? ---
+pages = d.get("pages") or doc.get("pages")
+print(f"\npages array present: {bool(pages)} ({len(pages) if pages else 0} pages)")
