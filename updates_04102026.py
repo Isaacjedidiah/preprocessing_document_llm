@@ -435,4 +435,63 @@ ev = evaluate_run(per_doc, result=result, elapsed_seconds=elapsed,
                   all_claims=all_claims)
 print(evaluation_table(ev, "v6 run"))
 
+# few_shot_example
+"""FIRM few-shot examples — filled in by teams, auto-loaded by the pipeline.
 
+Teams add a firm's chart example(s) HERE. When the pipeline processes a document
+it resolves the firm and looks it up; if present it uses that firm's example(s),
+otherwise it moves on with the normal (working) path — so firms without an entry
+are completely unaffected.
+
+PURPOSE: teach ONE specific, hard-to-read SKILL (e.g. reading a MISALIGNED /
+MISPLACED SCALE), NOT to make the model guess. Give a MINIMAL, TARGETED example:
+'here is a chart whose scale is misplaced, and here is how to read it correctly'.
+
+HOW TO ADD A FIRM
+-----------------
+1. Save the firm's example chart image to a Volume the cluster can read.
+2. Add an entry keyed by the firm's entity_name or entity_id (matched
+   case-insensitively, substring-tolerant, so 'IkeBank' matches 'Ike Bank Plc'):
+
+   FIRM_EXAMPLES = {
+       "IkeBank": [
+           {
+               "image_path": "/Volumes/<cat>/<schema>/<vol>/examples/ikebank_misaligned_scale.png",
+               # 'note' teaches the SPECIFIC skill + guards against guessing:
+               "note": ("In this chart the y-axis scale is MISALIGNED/offset — the "
+                        "gridline labels do not sit level with the plotted values. "
+                        "Read each bar/point against the TRUE scale position (interpolate "
+                        "between the correctly-placed gridlines), NOT the nearest printed "
+                        "label. IMPORTANT: only return values you can actually read; if a "
+                        "value is genuinely unreadable, OMIT it — do not guess."),
+               # 'output' = the CORRECT reading (demonstrates proper scale-reading,
+               # and omits anything unreadable so it does not model guessing):
+               "output": '{"claims": ['
+                         '{"field_name": "<series> | <category>", "value": "<correct value>", "confidence": 0.9}'
+                         ']}',
+           },
+       ],
+   }
+
+Rules:
+- Keep it MINIMAL — one targeted example per skill. More examples cost more per
+  read and can over-generalise.
+- The 'note' should name the specific skill AND tell the model to OMIT what it
+  cannot read (so a teaching example does not encourage guessing).
+- The 'output' MUST be VERIFIED-CORRECT and should itself omit anything unreadable.
+"""
+from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# TEAMS: add your firm entries here. Empty by default -> no firm is affected.
+# ---------------------------------------------------------------------------
+FIRM_EXAMPLES: dict = {
+    # "IkeBank": [
+    #     {
+    #         "image_path": "/Volumes/.../examples/ikebank_misaligned_scale.png",
+    #         "note": "In this chart the y-axis scale is MISALIGNED ... read against "
+    #                 "the TRUE scale position; OMIT anything you cannot read, do not guess.",
+    #         "output": '{"claims": [ ...verified-correct reading... ]}',
+    #     },
+    # ],
+}
