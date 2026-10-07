@@ -495,3 +495,130 @@ FIRM_EXAMPLES: dict = {
     #     },
     # ],
 }
+
+
+# =============================================================================
+#  FIRST-DRAFT TEST: X-AXIS LABEL RESOLUTION (geometry + LLM)
+#
+#  Your charts: spacing is ALWAYS regular; the problem is a varying START month
+#  and MISSING FIRST / LAST labels. Because spacing is regular, we can:
+#    1. LLM reads: each bar's VALUE + x-position, and each printed x-LABEL + position
+#    2. GEOMETRY: assign printed labels to nearest bars, derive the monthly stride
+#       from two anchors, then EXTRAPOLATE every bar's month (fills missing
+#       first/last labels, handles the varying start) — deterministic & safe
+#       because the stride is regular.
+#    3. OUTPUT: each VALUE attached to its correct resolved period.
+#
+#  Flags only when there are < 2 printed labels (stride cannot be derived).
+#  Run on ONE chart to validate before wiring into the pipeline.
+# =============================================================================
+import base64, json, re
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
+CHART_PATH = "/Volumes/<catalog>/<schema>/<volume>/test_chart.png"   # <-- your chart
+# client and run_async must be defined in your session
+
+# ---- 1. LLM reads values + positions + printed labels + positions ----
+READ_PROMPT = (
+    "You are reading a bar/line chart. Return STRICT JSON (no prose):\n"
+    '{"bars": [{"id": <int, left-to-right from 0>, "series": "<series>", '
+    '"value": <printed number>, "x_center": <horizontal PIXEL position of this '
+    'bar/point centre>}], '
+    '"labels": [{"text": "<x-axis label exactly as printed, e.g. Jul 2024>", '
+    '"x_center": <horizontal PIXEL position of this label centre>}]}\n'
+    "Rules:\n"
+    "- VALUE: the number PRINTED on/beside the bar/point, exactly. Do NOT estimate "
+    "from the axis scale.\n"
+    "- Give EVERY bar/point (even if it has no printed x-label) and EVERY printed "
+    "x-axis label, each with its x_center pixel position.\n"
+    "- Output ONLY the JSON object."
+)
+
+with open(CHART_PATH.replace("dbfs:", "/dbfs"), "rb") as f:
+    img_b64 = base64.b64encode(f.read()).decode()
+
+import asyncio
+async def _call():
+    resp = await client.extract("tier2", READ_PROMPT, "", {"name": "noop"},
+                                image_base64=img_b64)
+    return getattr(resp, "text", "") or json.dumps(getattr(resp, "tool_arguments", {}))
+
+raw = run_async(_call())
+try:
+    data = json.loads(raw.strip().strip("`").replace("json", "", 1).strip())
+except Exception:
+    m = re.search(r"\{.*\}", raw, re.S)
+    data = json.loads(m.group(0)) if m else {"bars": [], "labels": []}
+
+bars_in = data.get("bars", [])
+labels_in = data.get("labels", [])
+print(f"LLM read {len(bars_in)} bars, {len(labels_in)} printed labels")
+print(f"printed labels: {[(l.get('text'), l.get('x_center')) for l in labels_in]}\n")
+
+
+# ---- 2. GEOMETRY: resolve every bar's period from anchor + regular stride ----
+def resolve_axis_labels(detected_bars, detected_labels):
+    bars = sorted(detected_bars, key=lambda b: b.get('x_center', 0))
+
+    # assign each printed label to its nearest bar
+    assignments = {}
+    for lbl in detected_labels:
+        if not bars:
+            break
+        best = min(bars, key=lambda b: abs(b.get('x_center', 0) - lbl.get('x_center', 0)))
+        assignments[best['id']] = lbl.get('text', '')
+
+    # parse labeled bars to (bar_index, date) — parse WITH year when present
+    parsed = []
+    for idx, bar in enumerate(bars):
+        if bar['id'] in assignments:
+            text = str(assignments[bar['id']]).strip()
+            for fmt in ("%B %Y", "%b %Y", "%Y-%m", "%b-%y", "%B", "%b"):
+                try:
+                    parsed.append((idx, datetime.strptime(text, fmt)))
+                    break
+                except ValueError:
+                    continue
+
+    # need >= 2 anchors to DERIVE the stride; otherwise flag the unlabeled
+    if len(parsed) < 2:
+        return {b['id']: assignments.get(b['id'], "FLAG_REVIEW") for b in bars}, False
+
+    # derive the monthly stride (spacing is regular, so two anchors suffice)
+    (i1, d1), (i2, d2) = parsed[0], parsed[1]
+    months_diff = (d2.year - d1.year) * 12 + (d2.month - d1.month)
+    index_diff = (i2 - i1) or 1
+    step_months = int(round(months_diff / index_diff)) or 1
+
+    # compute EVERY bar's month from the anchor + stride (fills missing
+    # first/last labels; handles the varying start — no start assumption needed)
+    base_idx, base_date = parsed[0]
+    out = {}
+    for idx, bar in enumerate(bars):
+        if bar['id'] in assignments:
+            out[bar['id']] = assignments[bar['id']]                 # keep printed label
+        else:
+            inferred = base_date + relativedelta(months=(idx - base_idx) * step_months)
+            out[bar['id']] = inferred.strftime("%B %Y")             # include year
+    return out, True
+
+resolved, ok = resolve_axis_labels(bars_in, labels_in)
+
+# ---- 3. attach each VALUE to its resolved period ----
+print("=== RESULT (value -> resolved period) ===")
+bars_sorted = sorted(bars_in, key=lambda b: b.get('x_center', 0))
+for bar in bars_sorted:
+    period = resolved.get(bar['id'], "FLAG_REVIEW")
+    printed = "printed" if any(
+        min(bars_sorted, key=lambda b: abs(b.get('x_center',0)-l.get('x_center',0)))['id'] == bar['id']
+        for l in labels_in) else "inferred"
+    print(f"  {bar.get('series','?')} = {bar.get('value')}  ->  {period}  ({printed})")
+
+if not ok:
+    print("\n>>> FEWER THAN 2 PRINTED LABELS — stride could not be derived.")
+    print(">>> These must be FLAGGED for review (cannot resolve safely).")
+else:
+    print("\n>>> CHECK: is each value attached to the CORRECT period?")
+    print(">>> Printed labels kept as-is; missing first/last/middle inferred from")
+    print(">>> the regular monthly stride. If correct, wire this into the pipeline.")
