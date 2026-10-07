@@ -622,3 +622,135 @@ else:
     print("\n>>> CHECK: is each value attached to the CORRECT period?")
     print(">>> Printed labels kept as-is; missing first/last/middle inferred from")
     print(">>> the regular monthly stride. If correct, wire this into the pipeline.")
+
+
+# UPATE
+# =============================================================================
+#  FIRST-DRAFT TEST (fixed) — X-AXIS LABEL RESOLUTION (geometry + LLM)
+#
+#  FIX: the previous version passed a dummy tool schema and read resp.text,
+#  which returned empty. extract() FORCES tool-use, so we pass a REAL custom
+#  schema (bars/labels with x_center) and read resp.tool_arguments.
+# =============================================================================
+import base64, json, re
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
+CHART_PATH = "/Volumes/<catalog>/<schema>/<volume>/test_chart.png"   # <-- your chart
+# client and run_async must be defined in your session
+
+# a CUSTOM tool schema that asks for bars + labels WITH pixel positions
+READ_SCHEMA = {
+    "name": "record_chart",
+    "description": "Record a bar/line chart's bars and x-axis labels with positions.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "bars": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "left-to-right from 0"},
+                        "series": {"type": "string"},
+                        "value": {"type": "string", "description": "the number PRINTED on/beside the bar"},
+                        "x_center": {"type": "number", "description": "horizontal PIXEL position of the bar centre"},
+                    },
+                    "required": ["id", "value", "x_center"],
+                },
+            },
+            "labels": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "x-axis label exactly as printed"},
+                        "x_center": {"type": "number", "description": "horizontal PIXEL position of the label centre"},
+                    },
+                    "required": ["text", "x_center"],
+                },
+            },
+        },
+        "required": ["bars", "labels"],
+    },
+}
+
+READ_PROMPT = (
+    "You are reading a bar/line chart image. Record EVERY bar/point and EVERY "
+    "printed x-axis label, each with its horizontal PIXEL position (x_center, "
+    "0 = left edge). For a bar's value, use the number PRINTED on or beside it "
+    "exactly — do NOT estimate from the axis scale. Include bars even if they "
+    "have no printed x-axis label."
+)
+
+with open(CHART_PATH.replace("dbfs:", "/dbfs"), "rb") as f:
+    img_b64 = base64.b64encode(f.read()).decode()
+
+import asyncio
+async def _call():
+    resp = await client.extract("tier2", READ_PROMPT, "", READ_SCHEMA,
+                                image_base64=img_b64)
+    return resp
+
+resp = run_async(_call())
+ta = getattr(resp, "tool_arguments", None)
+print("tool_arguments present:", ta is not None)
+if not isinstance(ta, dict):
+    # fall back to text parse
+    txt = getattr(resp, "text", "") or ""
+    m = re.search(r"\{.*\}", txt, re.S)
+    ta = json.loads(m.group(0)) if m else {"bars": [], "labels": []}
+
+bars_in = ta.get("bars", [])
+labels_in = ta.get("labels", [])
+print(f"LLM read {len(bars_in)} bars, {len(labels_in)} printed labels")
+print(f"printed labels: {[(l.get('text'), l.get('x_center')) for l in labels_in]}\n")
+
+
+def resolve_axis_labels(detected_bars, detected_labels):
+    bars = sorted(detected_bars, key=lambda b: b.get('x_center', 0))
+    assignments = {}
+    for lbl in detected_labels:
+        if not bars:
+            break
+        best = min(bars, key=lambda b: abs(b.get('x_center', 0) - lbl.get('x_center', 0)))
+        assignments[best['id']] = lbl.get('text', '')
+
+    parsed = []
+    for idx, bar in enumerate(bars):
+        if bar['id'] in assignments:
+            text = str(assignments[bar['id']]).strip()
+            for fmt in ("%B %Y", "%b %Y", "%Y-%m", "%b-%y", "%B", "%b"):
+                try:
+                    parsed.append((idx, datetime.strptime(text, fmt)))
+                    break
+                except ValueError:
+                    continue
+
+    if len(parsed) < 2:
+        return {b['id']: assignments.get(b['id'], "FLAG_REVIEW") for b in bars}, False
+
+    (i1, d1), (i2, d2) = parsed[0], parsed[1]
+    months_diff = (d2.year - d1.year) * 12 + (d2.month - d1.month)
+    step = int(round(months_diff / ((i2 - i1) or 1))) or 1
+    base_idx, base_date = parsed[0]
+    out = {}
+    for idx, bar in enumerate(bars):
+        if bar['id'] in assignments:
+            out[bar['id']] = assignments[bar['id']]
+        else:
+            inferred = base_date + relativedelta(months=(idx - base_idx) * step)
+            out[bar['id']] = inferred.strftime("%B %Y")
+    return out, True
+
+resolved, ok = resolve_axis_labels(bars_in, labels_in)
+
+print("=== RESULT (value -> resolved period) ===")
+for bar in sorted(bars_in, key=lambda b: b.get('x_center', 0)):
+    print(f"  {bar.get('series','?')} = {bar.get('value')}  ->  {resolved.get(bar['id'], 'FLAG_REVIEW')}")
+
+if not ok:
+    print("\n>>> < 2 printed labels — stride not derivable — FLAG for review.")
+else:
+    print("\n>>> CHECK: each value attached to the correct period? Missing first/last")
+    print(">>> inferred from the regular monthly stride.")
